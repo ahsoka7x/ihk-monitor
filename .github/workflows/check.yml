@@ -2,7 +2,7 @@ name: IHK Termin Check
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "17 * * * *"        # Sicherheitsnetz: falls der Selbst-Neustart mal ausfällt
   workflow_dispatch:
     inputs:
       test:
@@ -10,25 +10,52 @@ on:
         type: boolean
         default: false
 
+permissions:
+  contents: read
+  actions: write
+
+# Es darf immer nur ein Dauerlauf aktiv sein; weitere warten in der Schlange.
+concurrency:
+  group: ihk-monitor-${{ github.event.inputs.test == 'true' && 'test' || 'main' }}
+  cancel-in-progress: false
+
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
+
+      - name: Startzeit merken
+        run: echo "START_TS=$(date +%s)" >> "$GITHUB_ENV"
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
       - name: Playwright installieren
         run: |
           pip install playwright
           playwright install --with-deps chromium
+
       - name: Termine prüfen
+        id: check
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: |
-          if [ "${{ inputs.test }}" = "true" ]; then
-            python check_termine.py --test
+          if [ "${{ github.event.inputs.test }}" = "true" ]; then
+            python -u check_termine.py --test
           else
-            python check_termine.py
+            python -u check_termine.py
+          fi
+
+      - name: Nächsten Lauf starten
+        if: ${{ !cancelled() && github.event.inputs.test != 'true' && (steps.check.outcome == 'success' || steps.check.outcome == 'failure') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # Nur neu starten, wenn dieser Lauf lange genug gedauert hat (verhindert Endlosschleifen bei Sofort-Fehlern)
+          if [ $(( $(date +%s) - START_TS )) -gt 1800 ]; then
+            gh workflow run check.yml --ref "${{ github.ref_name }}" || true
           fi
