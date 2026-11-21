@@ -9,6 +9,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.request
 
 # ---------------- Einstellungen ----------------
@@ -22,6 +23,10 @@ GEWUENSCHTE_DATEN = {              # nur Gesamtprüfungen an diesen Tagen
     "18.02.2027",
     "18.03.2027",
 }
+LAUFZEIT_SEKUNDEN = 340 * 60      # ein Lauf dauert ca. 5 h 40 min (GitHub-Limit: 6 h)
+PRUEF_INTERVALL = 300             # alle 5 Minuten prüfen (nicht schneller, sonst droht eine Sperre)
+ERINNERUNG_SEKUNDEN = 15 * 60     # solange ein Termin frei ist, alle 15 Minuten erinnern
+FEHLER_BIS_WARNUNG = 6            # nach 6 Fehlversuchen in Folge (30 Min) kommt eine Warn-Push
 # -----------------------------------------------
 
 DATE_RE = re.compile(r"^\d{2}\.\d{2}\.\d{4}$")
@@ -108,30 +113,79 @@ def main():
         print("Test-Nachricht gesendet.")
         return
 
-    blocks = hole_alle_blocks()
-    print(f"{len(blocks)} Termine gefunden:")
-    for b in blocks:
-        print(f"  {b['titel']} | {b['ort']} | {b['datum']} | {'AUSGEBUCHT' if b['ausgebucht'] else 'NICHT ausgebucht'}")
+    start = time.time()
+    erfolgreich = 0
+    fehler_in_folge = 0
+    letzte_meldung = {}   # (ort, datum) -> Zeitpunkt der letzten Push-Nachricht
+    fehlende_gemeldet = set()
+    durchgang = 0
 
-    gefunden = {
-        b["datum"] for b in blocks
-        if b["titel"].lower() in GEWUENSCHTE_TITEL
-    }
-    for datum in sorted(GEWUENSCHTE_DATEN - gefunden):
-        print(f"WARNUNG: Keine Gesamtprüfung am {datum} auf der Seite gefunden.")
+    while True:
+        durchgang += 1
+        t0 = time.time()
+        stempel = time.strftime("%H:%M:%S", time.gmtime())
+        try:
+            blocks = hole_alle_blocks()
+        except Exception as e:
+            print(f"[{stempel} UTC] #{durchgang} Fehler beim Laden: {e}", flush=True)
+            blocks = []
 
-    if not blocks:
-        # Seite nicht lesbar -> Lauf als fehlgeschlagen markieren (GitHub schickt dir dann eine Mail)
-        print("FEHLER: Keine Termine auf der Seite erkannt.")
+        if blocks:
+            erfolgreich += 1
+            if fehler_in_folge >= FEHLER_BIS_WARNUNG:
+                push("IHK-Monitor läuft wieder", "Die Terminseite ist wieder lesbar.", prio=3, click=link)
+            fehler_in_folge = 0
+
+            beobachtet = [
+                b for b in blocks
+                if b["titel"].lower() in GEWUENSCHTE_TITEL and b["datum"] in GEWUENSCHTE_DATEN
+            ]
+            zusammenfassung = ", ".join(
+                f"{b['ort']} {b['datum']} {'ausgebucht' if b['ausgebucht'] else 'FREI'}" for b in beobachtet
+            )
+            print(f"[{stempel} UTC] #{durchgang} {len(blocks)} Termine gelesen. Beobachtet: {zusammenfassung}", flush=True)
+
+            gefunden = {b["datum"] for b in beobachtet}
+            for datum in sorted(GEWUENSCHTE_DATEN - gefunden - fehlende_gemeldet):
+                fehlende_gemeldet.add(datum)
+                print(f"WARNUNG: Keine Gesamtprüfung am {datum} auf der Seite gefunden.", flush=True)
+
+            freie = finde_freie(blocks)
+            freie_keys = {(b["ort"], b["datum"]) for b in freie}
+            # Termine, die wieder ausgebucht sind, zurücksetzen
+            for key in list(letzte_meldung):
+                if key not in freie_keys:
+                    del letzte_meldung[key]
+
+            for b in freie:
+                key = (b["ort"], b["datum"])
+                if key in letzte_meldung and time.time() - letzte_meldung[key] < ERINNERUNG_SEKUNDEN:
+                    continue
+                letzte_meldung[key] = time.time()
+                push(
+                    f"Termin frei: {b['ort']} {b['datum']}",
+                    f"{b['titel']} in {b['ort']} am {b['datum']} ist nicht mehr ausgebucht! Schnell anmelden.\n\n{b['text']}",
+                    click=link,
+                )
+                print("Benachrichtigung gesendet für", b["ort"], b["datum"], flush=True)
+        else:
+            fehler_in_folge += 1
+            print(f"[{stempel} UTC] #{durchgang} Keine Termine erkannt ({fehler_in_folge} in Folge).", flush=True)
+            if fehler_in_folge == FEHLER_BIS_WARNUNG:
+                push(
+                    "IHK-Monitor: Problem",
+                    "Seit ca. 30 Minuten ist die Terminseite nicht lesbar. Eventuell hat die IHK die Seite umgebaut.",
+                    prio=3, click=link,
+                )
+
+        if time.time() - start + PRUEF_INTERVALL > LAUFZEIT_SEKUNDEN:
+            break
+        time.sleep(max(1, PRUEF_INTERVALL - (time.time() - t0)))
+
+    if erfolgreich == 0:
+        # In diesem Lauf nie lesbar -> Lauf als fehlgeschlagen markieren (GitHub schickt dir dann eine Mail)
+        print("FEHLER: In diesem Lauf konnte keine Prüfung erfolgreich durchgeführt werden.")
         sys.exit(1)
-
-    for b in finde_freie(blocks):
-        push(
-            f"Termin frei: {b['ort']} {b['datum']}",
-            f"{b['titel']} in {b['ort']} am {b['datum']} ist nicht mehr ausgebucht! Schnell anmelden.\n\n{b['text']}",
-            click=link,
-        )
-        print("Benachrichtigung gesendet für", b["ort"], b["datum"])
 
 
 if __name__ == "__main__":
