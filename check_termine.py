@@ -1,7 +1,9 @@
 """
 IHK-Termin-Monitor
 Prüft die IHK-Terminseite und schickt dir eine Push-Nachricht (ntfy),
-sobald eine Gesamtprüfung in Münster oder Gelsenkirchen NICHT mehr "Ausgebucht" ist.
+sobald eine Gesamtprüfung (keine Wiederholungsprüfung) an einem dieser Tage
+NICHT mehr "Ausgebucht" ist (egal in welcher Stadt):
+  20.01.2027, 21.01.2027, 17.02.2027, 18.02.2027, 18.03.2027
 """
 import json
 import os
@@ -13,7 +15,13 @@ import urllib.request
 BASE_URL = "https://ihkportal.de/nordwestfalen/tibrosPP/participant/exam/SKBW25?tab=registerToExam&pageNumber={page}"
 MAX_PAGES = 10
 GEWUENSCHTE_TITEL = {"gesamtprüfung"}              # Wiederholungsprüfungen zählen NICHT
-GEWUENSCHTE_ORTE = {"münster", "gelsenkirchen"}
+GEWUENSCHTE_DATEN = {              # nur Gesamtprüfungen an diesen Tagen
+    "20.01.2027",
+    "21.01.2027",
+    "17.02.2027",
+    "18.02.2027",
+    "18.03.2027",
+}
 # -----------------------------------------------
 
 DATE_RE = re.compile(r"^\d{2}\.\d{2}\.\d{4}$")
@@ -48,7 +56,7 @@ def finde_freie(blocks):
     return [
         b for b in blocks
         if b["titel"].lower() in GEWUENSCHTE_TITEL
-        and b["ort"].lower() in GEWUENSCHTE_ORTE
+        and b["datum"] in GEWUENSCHTE_DATEN
         and not b["ausgebucht"]
     ]
 
@@ -104,6 +112,13 @@ def main():
     print(f"{len(blocks)} Termine gefunden:")
     for b in blocks:
         print(f"  {b['titel']} | {b['ort']} | {b['datum']} | {'AUSGEBUCHT' if b['ausgebucht'] else 'NICHT ausgebucht'}")
+
+    gefunden = {
+        b["datum"] for b in blocks
+        if b["titel"].lower() in GEWUENSCHTE_TITEL
+    }
+    for datum in sorted(GEWUENSCHTE_DATEN - gefunden):
+        print(f"WARNUNG: Keine Gesamtprüfung am {datum} auf der Seite gefunden.")
 
     if not blocks:
         # Seite nicht lesbar -> Lauf als fehlgeschlagen markieren (GitHub schickt dir dann eine Mail)
